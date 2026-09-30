@@ -1,0 +1,416 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\Exam;
+use App\Models\Grade;
+use App\Models\Module;
+use App\Models\Notification;
+use App\Models\Student;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\DB;
+
+class TeacherGradesController extends Controller
+{
+    /**
+     * List exams for this teacher
+     */
+    public function exams(Request $request): JsonResponse
+    {
+        $teacher = $request->user()->teacher;
+
+        if (!$teacher) {
+            return response()->json(['message' => 'Teacher profile not found'], 404);
+        }
+
+        // Get module IDs for this teacher
+        $moduleIds = $teacher->modules()->pluck('modules.id');
+
+        $query = Exam::whereIn('module_id', $moduleIds)
+            ->with('module');
+
+        if ($request->module_id) {
+            $query->where('module_id', $request->module_id);
+        }
+
+        if ($request->from) {
+            $query->whereDate('exam_date', '>=', $request->from);
+        }
+        if ($request->to) {
+            $query->whereDate('exam_date', '<=', $request->to);
+        }
+        if ($request->upcoming) {
+            $query->where('exam_date', '>=', now());
+        }
+
+        // Eager load grades count
+        $query->withCount('grades as results_count');
+
+        $exams = $query->orderBy('exam_date', 'desc')->paginate(10);
+
+        // Transform
+        $exams->getCollection()->transform(function ($exam) {
+            return [
+                'id' => $exam->id,
+                'title' => $exam->title ?? ucfirst($exam->exam_type) . ' Exam',
+                'type' => $exam->exam_type,
+                'date' => $exam->exam_date->format('Y-m-d'),
+                'max_mark' => 20,
+                'status' => $exam->status,
+                'group' => $exam->group,
+                'duration_minutes' => $exam->duration_minutes,
+                'module' => [
+                    'id' => $exam->module->id,
+                    'code' => $exam->module->code,
+                    'name' => $exam->module->name,
+                ],
+                'results_count' => $exam->results_count,
+            ];
+        });
+
+        return response()->json($exams);
+    }
+
+    /**
+     * Get students for one exam + current marks
+     */
+    public function examStudents(Exam $exam): JsonResponse
+    {
+        $teacher = request()->user()->teacher;
+
+        if (!$teacher) {
+            return response()->json(['message' => 'Teacher profile not found'], 404);
+        }
+
+        // Authorization: Check if teacher is assigned to the module
+        if (!$teacher->modules()->where('modules.id', $exam->module_id)->exists()) {
+            return response()->json(['message' => 'Unauthorized access to this exam'], 403);
+        }
+
+        $module = $exam->module;
+
+        // Get students for this module (Specialty match)
+        $students = Student::where('specialty_id', $module->specialty_id)
+            ->with('user') // Eager load user for email
+            ->orderBy('last_name')
+            ->get();
+
+        // Get existing grades for this exam
+        $grades = Grade::where('exam_id', $exam->id)->get()->keyBy('student_id');
+
+        $studentList = $students->map(function ($student) use ($grades) {
+            $grade = $grades->get($student->id);
+            $mark = $grade ? (float)$grade->grade : null;
+            return [
+                'id' => $student->id,
+                'registration_number' => $student->registration_number,
+                'full_name' => $student->full_name,
+                'email' => $student->user->email ?? null,
+                'mark' => $mark,
+                'grade_letter' => $mark !== null ? $this->calculateGradeLetter($mark) : null,
+            ];
+        });
+
+        return response()->json([
+            'exam' => [
+                'id' => $exam->id,
+                'title' => $exam->title ?? ucfirst($exam->exam_type) . ' Exam',
+                'type' => $exam->exam_type,
+                'date' => $exam->exam_date->format('Y-m-d'),
+                'max_mark' => 20,
+                'module' => [
+                    'id' => $module->id,
+                    'code' => $module->code,
+                    'name' => $module->name,
+                ]
+            ],
+            'students' => $studentList
+        ]);
+    }
+
+    /**
+     * Create/update marks for an exam
+     */
+    public function storeResults(Request $request, Exam $exam): JsonResponse
+    {
+        $teacher = $request->user()->teacher;
+
+        if (!$teacher) {
+            return response()->json(['message' => 'Teacher profile not found'], 404);
+        }
+
+        if (!$teacher->modules()->where('modules.id', $exam->module_id)->exists()) {
+            return response()->json(['message' => 'Unauthorized access to this exam'], 403);
+        }
+
+        $validated = $request->validate([
+            'results' => 'required|array|min:1',
+            'results.*.student_id' => 'required|exists:students,id',
+            'results.*.mark' => 'required|numeric|min:0|max:20',
+            'results.*.note' => 'nullable|string|max:255',
+        ]);
+
+        // Only students of this exam's specialty AND current semester may be
+        // graded. Without this a teacher could post a mark for ANY student in the
+        // database (another specialty / semester), corrupting deliberations.
+        $eligibleStudents = Student::where('specialty_id', $exam->specialty_id)
+            ->where('current_semester', $exam->semester)
+            ->get()
+            ->keyBy('id');
+
+        $invalidIds = collect($validated['results'])
+            ->pluck('student_id')
+            ->reject(fn ($id) => $eligibleStudents->has($id));
+
+        if ($invalidIds->isNotEmpty()) {
+            return response()->json([
+                'message' => 'Certains étudiants ne font pas partie de cet examen.',
+            ], 422);
+        }
+
+        $updatedStudents = [];
+
+        DB::transaction(function () use ($exam, $validated, $eligibleStudents, &$updatedStudents) {
+            foreach ($validated['results'] as $result) {
+                Grade::updateOrCreate(
+                    [
+                        'exam_id' => $exam->id,
+                        'student_id' => $result['student_id'],
+                    ],
+                    [
+                        'module_id' => $exam->module_id,
+                        'grade' => $result['mark'],
+                        'semester' => $exam->semester,
+                        'academic_year' => $exam->academic_year,
+                        // 'note' => $result['note'] // Note column does not exist in grades table
+                    ]
+                );
+
+                $student = $eligibleStudents->get($result['student_id']);
+                if ($student) {
+                    $updatedStudents[] = [
+                        'id' => $student->id,
+                        'registration_number' => $student->registration_number,
+                        'full_name' => $student->full_name,
+                        'mark' => $result['mark'],
+                        'grade_letter' => $this->calculateGradeLetter($result['mark']),
+                    ];
+                }
+            }
+        });
+
+        return response()->json([
+            'message' => 'Exam results saved successfully.',
+            'exam_id' => $exam->id,
+            'students' => $updatedStudents
+        ]);
+    }
+
+    /**
+     * Exam results summary for this teacher
+     */
+    public function history(Request $request): JsonResponse
+    {
+        $teacher = $request->user()->teacher;
+
+        if (!$teacher) {
+            return response()->json(['message' => 'Teacher profile not found'], 404);
+        }
+
+        $moduleIds = $teacher->modules()->pluck('modules.id');
+
+        $query = Exam::whereIn('module_id', $moduleIds)
+            ->whereHas('grades') // Only exams with grades
+            ->with(['module', 'grades']);
+
+        if ($request->module_id) {
+            $query->where('module_id', $request->module_id);
+        }
+        if ($request->from) {
+            $query->whereDate('exam_date', '>=', $request->from);
+        }
+        if ($request->to) {
+            $query->whereDate('exam_date', '<=', $request->to);
+        }
+
+        $exams = $query->orderBy('exam_date', 'desc')->paginate(10);
+
+        $exams->getCollection()->transform(function ($exam) {
+            $grades = $exam->grades;
+            $count = $grades->count();
+            $avg = $count > 0 ? $grades->avg('grade') : 0;
+            $min = $count > 0 ? $grades->min('grade') : 0;
+            $max = $count > 0 ? $grades->max('grade') : 0;
+
+            return [
+                'exam_id' => $exam->id,
+                'title' => $exam->title ?? ucfirst($exam->exam_type) . ' Exam',
+                'type' => $exam->exam_type,
+                'date' => $exam->exam_date->format('Y-m-d'),
+                'module' => [
+                    'id' => $exam->module->id,
+                    'code' => $exam->module->code,
+                    'name' => $exam->module->name,
+                ],
+                'max_mark' => 20,
+                'students_count' => $count,
+                'avg_mark' => round($avg, 2),
+                'min_mark' => $min,
+                'max_mark_obtained' => $max,
+            ];
+        });
+
+        return response()->json($exams);
+    }
+
+    /**
+     * Store a new Exam
+     */
+        public function storeExam(Request $request): JsonResponse
+    {
+        $teacher = $request->user()->teacher;
+
+        if (!$teacher) {
+            return response()->json(['message' => 'Teacher profile not found'], 404);
+        }
+
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'exam_type' => 'required|in:controle,examen',
+            'exam_date' => 'required|date',
+            'module_id' => 'required|exists:modules,id',
+            'group' => 'nullable|string|max:255',
+            'duration_minutes' => 'required|integer',
+        ]);
+
+        $module = Module::find($validated['module_id']);
+        if (!$teacher->modules()->where('modules.id', $validated['module_id'])->exists()) {
+            return response()->json(['message' => 'Unauthorized access to this module'], 403);
+        }
+
+        $validated['teacher_id'] = $teacher->id;
+        $validated['status'] = 'draft';
+        $validated['specialty_id'] = $module->specialty_id;
+        $validated['semester'] = $module->semester;
+        // Derive the academic year from the currently active session instead of a
+        // hardcoded value (which never advanced and froze every exam to one year).
+        $activeSession = \App\Models\TrainingSession::where('status', 'active')->first();
+        $validated['academic_year'] = $activeSession
+            ? $activeSession->academicYear()
+            : now()->year . '-' . (now()->year + 1);
+
+        $exam = Exam::create($validated);
+
+        // Optionally notify students
+        if ($module) {
+            $students = Student::where('specialty_id', $module->specialty_id)
+                ->where('current_semester', $module->semester)
+                ->get();
+            foreach ($students as $student) {
+                if ($student->user_id) {
+                    Notification::create([
+                        'user_id' => $student->user_id,
+                        'title' => 'New Exam Scheduled',
+                        'message' => "A new {$exam->exam_type} for module {$module->name} has been scheduled on {$exam->exam_date->format('Y-m-d')}.",
+                        'type' => 'info',
+                    ]);
+                }
+            }
+        }
+
+        return response()->json([
+            'message' => 'Exam created successfully',
+            'exam' => $exam
+        ], 201);
+    }
+
+    /**
+     * Update an existing Exam
+     */
+    public function updateExam(Request $request, Exam $exam): JsonResponse
+    {
+        $teacher = $request->user()->teacher;
+
+        if (!$teacher) {
+            return response()->json(['message' => 'Teacher profile not found'], 404);
+        }
+
+        // Authorization: Check if teacher is assigned to the module
+        if (!$teacher->modules()->where('modules.id', $exam->module_id)->exists()) {
+            return response()->json(['message' => 'Unauthorized access to this exam'], 403);
+        }
+
+        $validated = $request->validate([
+            'title' => 'required|string|max:255',
+            'exam_type' => 'required|in:controle,examen',
+            'exam_date' => 'required|date',
+            'module_id' => 'required|exists:modules,id',
+            'group' => 'nullable|string|max:255',
+            'duration_minutes' => 'required|integer',
+        ]);
+
+        if ($exam->status !== 'draft' && $exam->status !== 'submitted') {
+            return response()->json(['message' => 'Cannot update exam with current status'], 400);
+        }
+
+        // If module is changed, verify ownership of the new module
+        if ($validated['module_id'] != $exam->module_id) {
+            if (!$teacher->modules()->where('modules.id', $validated['module_id'])->exists()) {
+                return response()->json(['message' => 'Unauthorized access to the target module'], 403);
+            }
+        }
+
+        if ($exam->status === 'submitted') {
+            $validated['status'] = 'modified';
+        }
+
+        $exam->update($validated);
+
+        return response()->json([
+            'message' => 'Exam updated successfully',
+            'exam' => $exam
+        ]);
+    }
+
+    /**
+     * Update the status of an exam directly
+     */
+    public function updateStatus(Request $request, Exam $exam): JsonResponse
+    {
+        $teacher = $request->user()->teacher;
+
+        if (!$teacher) {
+            return response()->json(['message' => 'Teacher profile not found'], 404);
+        }
+
+        if (!$teacher->modules()->where('modules.id', $exam->module_id)->exists()) {
+            return response()->json(['message' => 'Unauthorized access to this exam'], 403);
+        }
+
+        $validated = $request->validate([
+            'status' => 'required|string|in:submitted',
+        ]);
+
+        $exam->update(['status' => $validated['status']]);
+
+        return response()->json([
+            'message' => 'Exam status updated successfully',
+            'exam' => $exam
+        ]);
+    }
+
+    /**
+     * Calculate grade letter based on mark (0-20 scale)
+     */
+    private function calculateGradeLetter($mark)
+    {
+        if ($mark >= 16) return 'A'; // Excellent
+        if ($mark >= 14) return 'B'; // Very Good
+        if ($mark >= 12) return 'C'; // Good
+        if ($mark >= 10) return 'D'; // Pass
+        return 'F'; // Fail
+    }
+}
+

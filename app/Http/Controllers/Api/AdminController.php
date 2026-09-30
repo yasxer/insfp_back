@@ -1,0 +1,1747 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\User;
+use App\Models\Student;
+use App\Models\Teacher;
+use App\Models\Administration;
+use App\Models\Specialty;
+use App\Models\Module;
+use App\Models\Grade;
+use App\Models\Deliberation;
+use App\Models\RegistrationNumber;
+use App\Models\TrainingSession;
+use App\Models\SessionSpecialty;
+use App\Models\Exam;
+use Illuminate\Http\Request;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Validation\Rule;
+use App\Http\Requests\StudentStoreRequest;
+use App\Http\Requests\TeacherStoreRequest;
+use App\Http\Requests\ModuleStoreRequest;
+
+class AdminController extends Controller
+{
+    // ═══════════════════════════════════════════════════════════
+    // DASHBOARD & STATISTICS
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Get dashboard statistics
+     */
+    public function dashboard(): JsonResponse
+    {
+        $stats = [
+            'students' => [
+                'total' => Student::count(),
+                'approved' => Student::whereHas('user', function($q) {
+                    $q->where('is_approved', true);
+                })->count(),
+                'pending' => Student::whereHas('user', function($q) {
+                    $q->where('is_approved', false);
+                })->count(),
+                'graduated' => Student::where('is_graduated', true)->count(),
+            ],
+            'teachers' => [
+                'total' => Teacher::count(),
+                'active' => Teacher::whereHas('user', function($q) {
+                    $q->where('is_approved', true);
+                })->count(),
+            ],
+            'specialties' => [
+                'total' => Specialty::count(),
+                'active' => Specialty::where('is_active', true)->count(),
+            ],
+            'modules' => [
+                'total' => Module::count(),
+            ],
+            'registration_numbers' => [
+                'available' => RegistrationNumber::where('is_used', false)->count(),
+                'used' => RegistrationNumber::where('is_used', true)->count(),
+            ],
+        ];
+
+        return response()->json([
+            'statistics' => $stats,
+        ]);
+    }
+
+    /**
+     * Get detailed statistics for admin dashboard
+     */
+    public function statistics()
+    {
+        $now = now();
+        $lastMonth = $now->copy()->subMonth();
+        $lastWeek = $now->copy()->subWeek();
+
+        // Current counts
+        $totalStudents = Student::count();
+        $totalTeachers = Teacher::count();
+        $totalSpecialties = Specialty::count();
+        $activeExams = Exam::upcoming()->count();
+
+        // Calculate percentage changes
+        $studentLastMonth = Student::where('created_at', '<', $lastMonth)->count();
+        $studentChange = $studentLastMonth > 0
+            ? round((($totalStudents - $studentLastMonth) / $studentLastMonth) * 100, 1)
+            : 0;
+
+        $teacherLastMonth = Teacher::where('created_at', '<', $lastMonth)->count();
+        $teacherChange = $teacherLastMonth > 0
+            ? round((($totalTeachers - $teacherLastMonth) / $teacherLastMonth) * 100, 1)
+            : 0;
+
+        $specialtyLastWeek = Specialty::where('created_at', '<', $lastWeek)->count();
+        $specialtyChange = $totalSpecialties - $specialtyLastWeek;
+
+        $examLastMonth = Exam::upcoming()->where('created_at', '<', $lastMonth)->count();
+        $examChange = $examLastMonth > 0
+            ? round((($activeExams - $examLastMonth) / $examLastMonth) * 100, 1)
+            : 0;
+
+        return response()->json([
+            'students' => [
+                'count' => $totalStudents,
+                'change' => $studentChange,
+                'trend' => $studentChange >= 0 ? 'up' : 'down'
+            ],
+            'teachers' => [
+                'count' => $totalTeachers,
+                'change' => $teacherChange,
+                'trend' => $teacherChange >= 0 ? 'up' : 'down'
+            ],
+            'specialties' => [
+                'count' => $totalSpecialties,
+                'change' => $specialtyChange,
+                'trend' => $specialtyChange >= 0 ? 'up' : 'down'
+            ],
+            'exams' => [
+                'count' => $activeExams,
+                'change' => $examChange,
+                'trend' => $examChange >= 0 ? 'up' : 'down'
+            ]
+        ]);
+    }
+
+    /**
+     * Get random students for featured table
+     */
+    public function randomStudents(Request $request)
+    {
+        $limit = $request->input('limit', 7);
+
+        $students = Student::with('specialty')
+            ->inRandomOrder()
+            ->limit($limit)
+            ->get()
+            ->map(function ($student) {
+                return [
+                    'id' => $student->id,
+                    'name' => $student->full_name,
+                    'registration_number' => $student->registration_number,
+                    'specialty' => $student->specialty ? $student->specialty->name : 'N/A',
+                    'year' => ceil($student->current_semester / 2),
+                    'status' => $student->is_graduated ? 'Graduated' : 'Enrolled',
+                    'avatar_initials' => substr($student->first_name, 0, 1) . substr($student->last_name, 0, 1)
+                ];
+            });
+
+        return response()->json($students);
+    }
+
+    /**
+     * Get students distribution by specialty
+     */
+    public function studentsBySpecialty()
+    {
+        $data = Student::select('specialty_id', DB::raw('count(*) as count'))
+            ->groupBy('specialty_id')
+            ->with('specialty')
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'name' => $item->specialty ? $item->specialty->name : 'Unknown',
+                    'count' => $item->count
+                ];
+            });
+
+        return response()->json($data);
+    }
+
+    /**
+     * Get teachers distribution by specialty
+     */
+    public function teachersBySpecialty()
+    {
+        $data = Teacher::select('specialization', DB::raw('count(*) as count'))
+            ->groupBy('specialization')
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'name' => $item->specialization ?: 'General',
+                    'count' => $item->count
+                ];
+            });
+
+        return response()->json($data);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // REGISTRATION NUMBER MANAGEMENT
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Get sessions suitable for registration (Future or Current)
+     */
+    public function getRegistrationSessions()
+    {
+        // Get sessions that haven't ended yet
+        $sessions = TrainingSession::where('end_date', '>=', now())
+            ->orderBy('start_date', 'asc')
+            ->get(['id', 'name', 'start_date', 'end_date', 'year']);
+
+        return response()->json($sessions);
+    }
+
+    /**
+     * Get specialties for a specific session
+     */
+    public function getRegistrationSessionSpecialties($sessionId)
+    {
+        $sessionSpecialties = SessionSpecialty::where('session_id', $sessionId)
+            ->with('specialty')
+            ->get()
+            ->map(function ($item) {
+                return [
+                    'id' => $item->specialty->id,
+                    'name' => $item->specialty->name,
+                    'code' => $item->specialty->code,
+                    'study_type' => $item->study_type_label,
+                ];
+            });
+
+        return response()->json($sessionSpecialties);
+    }
+
+    /**
+     * Generate ONE registration number (Modified for session and 4 digits)
+     */
+    public function generateRegistrationNumber(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'specialty_id' => 'required|exists:specialties,id',
+            'session_id' => 'required|exists:sessions,id',
+        ]);
+
+        $specialty = Specialty::findOrFail($request->specialty_id);
+        $session = TrainingSession::findOrFail($request->session_id);
+
+        // Registration numbers may only be issued for a session that is still open
+        // (en attente) or currently running — never for an archived one.
+        if (!in_array($session->status, ['pending', 'active'])) {
+            return response()->json([
+                'message' => 'Impossible de générer un numéro pour une session archivée.',
+            ], 422);
+        }
+
+        // Get session year
+        $year = $session->year;
+
+        // ── Registration number format ──────────────────────────────
+        // NNNN: 4-digit sequential number
+        // 1/2 : session intake (Février -> 1, Septembre -> 2)
+        // YY  : last 2 digits of the session year (2025 -> 25)
+        // P/C/A : study type (Présentiel / Cours du soir / Apprentissage)
+        // 16  : Wilaya code (fixed)
+        // 47  : INSFP code (fixed)
+        // Example: 0001125P1647
+        $insfpCode = '47';
+        $wilayaCode = '16';
+
+        // Study type is defined on the session/specialty pivot
+        $sessionSpecialty = SessionSpecialty::where('session_id', $session->id)
+            ->where('specialty_id', $specialty->id)
+            ->firstOrFail();
+
+        $typeMap = [
+            'presential'    => 'P',
+            'cours_soir'    => 'C',
+            'apprentissage' => 'A',
+        ];
+        $typeChar = $typeMap[$sessionSpecialty->study_type] ?? 'P';
+
+        $yy = substr((string) $year, -2);
+        $sessionChar = $session->month == 2 ? '1' : '2'; // Février = 1, Septembre = 2
+
+        // Everything after the sequence is a fixed suffix per (session + study type)
+        $suffix = $sessionChar . $yy . $typeChar . $wilayaCode . $insfpCode;
+
+        // Find last number with this suffix. Sequence is at the front, and all
+        // matching numbers share the same suffix + length, so ordering desc
+        // puts the highest sequence first.
+        // The sequence is computed from the current max, so two admins generating
+        // the same suffix at the same time could compute the same number. The DB
+        // unique index on `number` guarantees only one ever lands; on the rare
+        // collision we simply recompute and retry instead of failing with a 500.
+        $registrationNumber = null;
+        $number = null;
+
+        for ($attempt = 0; $attempt < 5; $attempt++) {
+            $lastNumber = RegistrationNumber::where('number', 'like', '%' . $suffix)
+                ->orderBy('number', 'desc')
+                ->first();
+
+            // Sequence calculation (first 4 digits)
+            $sequence = $lastNumber
+                ? intval(substr($lastNumber->number, 0, 4)) + 1 // 4 digits
+                : 1;
+
+            // Final Format: NNNN + 1/2 + YY + P/C/A + 16 + 47
+            $number = str_pad($sequence, 4, '0', STR_PAD_LEFT) . $suffix;
+
+            try {
+                $registrationNumber = RegistrationNumber::create([
+                    'number' => $number,
+                    'specialty_id' => $request->specialty_id,
+                    'session_id' => $session->id,
+                    'academic_year' => $year . '-' . ($year + 1), // Optional but good to keep
+                    'is_used' => false,
+                ]);
+                break;
+            } catch (\Illuminate\Database\QueryException $e) {
+                // 23000 = integrity constraint violation (duplicate number). Retry.
+                if ($e->getCode() !== '23000' || $attempt === 4) {
+                    throw $e;
+                }
+            }
+        }
+
+        return response()->json([
+            'message' => 'Registration number generated successfully',
+            'registration_number' => $number,
+            'specialty' => $specialty->name,
+            'session' => $session->name,
+            'academic_year' => $registrationNumber->academic_year,
+        ], 201);
+    }
+
+    /**
+     * Get ALL registration numbers with filters
+     */
+    public function getRegistrationNumbers(Request $request): JsonResponse
+    {
+        $query = RegistrationNumber::with(['specialty', 'session']);
+
+        // Filter by session
+        if ($request->has('session_id') && $request->session_id) {
+            $query->where('session_id', $request->session_id);
+        }
+
+        // Filter by specialty
+        if ($request->has('specialty_id') && $request->specialty_id) {
+            $query->where('specialty_id', $request->specialty_id);
+        }
+
+        // Filter by status (used/available)
+        if ($request->has('status') && $request->status !== 'all') {
+            $status = $request->status === 'used';
+            $query->where('is_used', $status);
+        }
+
+        // Search by number
+        if ($request->has('search') && $request->search) {
+            $query->where('number', 'like', '%' . $request->search . '%');
+        }
+
+        $numbers = $query->orderBy('created_at', 'desc')->paginate(20);
+
+        // Preload the students for the used numbers on this page in a single query
+        // (avoids an N+1) and keys them by registration number for O(1) lookup.
+        $usedNumbers = $numbers->getCollection()->where('is_used', true)->pluck('number');
+        $studentsByNumber = Student::whereIn('registration_number', $usedNumbers)
+            ->get()
+            ->keyBy('registration_number');
+
+        // Transform the collection but keep pagination
+        $numbers->getCollection()->transform(function ($regNum) use ($studentsByNumber) {
+            $studentName = null;
+            if ($regNum->is_used) {
+                $student = $studentsByNumber->get($regNum->number);
+                $studentName = $student ? $student->full_name : 'Unknown';
+            }
+
+            return [
+                'id' => $regNum->id,
+                'number' => $regNum->number,
+                'specialty' => $regNum->specialty->name ?? 'N/A',
+                'session' => $regNum->session->name ?? 'N/A',
+                'status' => $regNum->is_used ? 'Used' : 'Available',
+                'used_by' => $studentName,
+                'academic_year' => $regNum->academic_year,
+                'created_at' => $regNum->created_at->format('Y-m-d H:i'),
+            ];
+        });
+
+        return response()->json($numbers);
+    }
+
+    /**
+     * Get available registration numbers
+     */
+    public function availableRegistrationNumbers(Request $request): JsonResponse
+    {
+        $query = RegistrationNumber::with('specialty')->where('is_used', false);
+
+        if ($request->specialty_id) {
+            $query->where('specialty_id', $request->specialty_id);
+        }
+
+        $numbers = $query->orderBy('number')->get()->map(function ($regNum) {
+            return [
+                'id' => $regNum->id,
+                'number' => $regNum->number,
+                'specialty' => $regNum->specialty->name,
+                'academic_year' => $regNum->academic_year,
+                'created_at' => $regNum->created_at->format('Y-m-d H:i'),
+            ];
+        });
+
+        return response()->json([
+            'available_numbers' => $numbers,
+            'count' => $numbers->count(),
+        ]);
+    }
+
+    /**
+     * Get used registration numbers
+     */
+    public function usedRegistrationNumbers(Request $request): JsonResponse
+    {
+        $query = RegistrationNumber::with(['specialty'])
+            ->where('is_used', true);
+
+        if ($request->specialty_id) {
+            $query->where('specialty_id', $request->specialty_id);
+        }
+
+        $numbers = $query->orderBy('used_at', 'desc')->get()->map(function ($regNum) {
+            $student = Student::where('registration_number', $regNum->number)->with('user')->first();
+
+            return [
+                'id' => $regNum->id,
+                'number' => $regNum->number,
+                'specialty' => $regNum->specialty->name,
+                'academic_year' => $regNum->academic_year,
+                'used_at' => $regNum->used_at->format('Y-m-d H:i'),
+                'student' => $student ? [
+                    'full_name' => $student->full_name,
+                    'email' => $student->user->email ?? null,
+                    'is_approved' => $student->user ? $student->user->is_approved : false,
+                ] : null,
+            ];
+        });
+
+        return response()->json([
+            'used_numbers' => $numbers,
+            'count' => $numbers->count(),
+        ]);
+    }
+
+    /**
+     * Delete unused registration number
+     */
+    public function deleteRegistrationNumber(Request $request, $id): JsonResponse
+    {
+        $regNum = RegistrationNumber::findOrFail($id);
+
+        if ($regNum->is_used) {
+            return response()->json([
+                'message' => 'Impossible de supprimer un numéro déjà utilisé',
+            ], 400);
+        }
+
+        $number = $regNum->number;
+        $regNum->delete();
+
+        return response()->json([
+            'message' => 'Numéro supprimé avec succès',
+            'number' => $number,
+        ]);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // STUDENT MANAGEMENT (FULL CRUD)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Get all students with filters
+     */
+    public function getStudents(Request $request): JsonResponse
+    {
+        $query = Student::with(['user', 'specialty']);
+
+        // Filter by approval status
+        if ($request->has('approved')) {
+            $query->whereHas('user', function ($q) use ($request) {
+                $q->where('is_approved', $request->boolean('approved'));
+            });
+        }
+
+        // Filter by specialty
+        if ($request->specialty_id) {
+            $query->where('specialty_id', $request->specialty_id);
+        }
+
+        // Filter by semester
+        if ($request->semester) {
+            $query->where('current_semester', $request->semester);
+        }
+
+        // Filter by group
+        if ($request->group) {
+            $query->where('group', $request->group);
+        }
+
+        // Filter by study mode
+        if ($request->study_mode) {
+            $query->where('study_mode', $request->study_mode);
+        }
+
+        // Filter by graduated status
+        if ($request->has('is_graduated')) {
+            $query->where('is_graduated', $request->boolean('is_graduated'));
+        }
+
+        // Filter by graduation year
+        if ($request->graduation_year) {
+            $query->where('graduation_year', $request->graduation_year);
+        }
+
+        // Search by name or registration number
+        if ($request->search) {
+            $search = $request->search;
+            $query->where(function($q) use ($search) {
+                $q->where('registration_number', 'like', "%{$search}%")
+                  ->orWhere('first_name', 'like', "%{$search}%")
+                  ->orWhere('last_name', 'like', "%{$search}%")
+                  ->orWhereRaw("CONCAT(first_name, ' ', last_name) LIKE ?", ["%{$search}%"]);
+            });
+        }
+
+        $perPage = $request->input('per_page', 10);
+        $students = $query->orderBy('registration_number')->paginate($perPage);
+
+        $students->getCollection()->transform(function ($student) {
+            return [
+                'id' => $student->id,
+                'registration_number' => $student->registration_number,
+                'full_name' => $student->full_name,
+                'first_name' => $student->first_name,
+                'last_name' => $student->last_name,
+                'email' => $student->user->email ?? null,
+                'phone' => $student->user->phone ?? null,
+                'is_approved' => $student->user ? $student->user->is_approved : false,
+                'specialty' => $student->specialty ? [
+                    'id' => $student->specialty->id,
+                    'name' => $student->specialty->name,
+                    'code' => $student->specialty->code,
+                ] : null,
+                'study_mode' => $student->study_mode,
+                'current_semester' => $student->current_semester,
+                'group' => $student->group,
+                'years_enrolled' => $student->years_enrolled,
+                'is_graduated' => $student->is_graduated,
+                'graduation_year' => $student->graduation_year,
+                'graduation_semester' => $student->graduation_semester,
+                'final_gpa' => $student->final_gpa,
+                'created_at' => $student->created_at->format('Y-m-d'),
+                'avatar_url' => null, // Placeholder
+            ];
+        });
+
+        return response()->json($students);
+    }
+
+    /**
+     * Create new student
+     */
+    public function createStudent(StudentStoreRequest $request): JsonResponse
+    {
+        $validated = $request->validated();
+
+        DB::beginTransaction();
+
+        try {
+            // Create User
+            $user = User::create([
+                'email' => $validated['email'],
+                'phone' => $validated['phone'] ?? null,
+                'first_name' => $validated['first_name'],
+                'last_name' => $validated['last_name'],
+                'password' => Hash::make($validated['password'] ?? $validated['registration_number']),
+                'role' => 'student',
+                'is_approved' => true, // Admin created students are approved by default
+            ]);
+
+            // Create Student
+            $student = Student::create([
+                'user_id' => $user->id,
+                'specialty_id' => $validated['specialty_id'],
+                'registration_number' => $validated['registration_number'],
+                'first_name' => $validated['first_name'],
+                'last_name' => $validated['last_name'],
+                'date_of_birth' => $validated['date_of_birth'],
+                'address' => $validated['address'],
+                'study_mode' => $validated['study_mode'],
+                'current_semester' => $validated['current_semester'],
+                'group' => $validated['group'] ?? null,
+                'years_enrolled' => $validated['years_enrolled'] ?? 1,
+                'is_graduated' => false,
+            ]);
+
+            // Mark registration number as used
+            RegistrationNumber::where('number', $validated['registration_number'])
+                ->update(['is_used' => true, 'used_at' => now()]);
+
+            DB::commit();
+
+            return response()->json([
+                'message' => 'Étudiant créé avec succès',
+                'student' => $student,
+            ], 201);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Get single student details with grades and semester averages
+     */
+    public function getStudent($id): JsonResponse
+    {
+        $student = Student::with(['user', 'specialty'])->findOrFail($id);
+
+        // Get current semester grades with modules
+        $currentSemesterGrades = Grade::with('module')
+            ->where('student_id', $student->id)
+            ->where('semester', $student->current_semester)
+            ->get()
+            ->map(function ($grade) {
+                return [
+                    'id' => $grade->id,
+                    'module_id' => $grade->module_id,
+                    'module_name' => $grade->module->name ?? 'N/A',
+                    'module_code' => $grade->module->code ?? 'N/A',
+                    'coefficient' => $grade->module->coefficient ?? 1,
+                    'grade' => $grade->grade,
+                    'academic_year' => $grade->academic_year,
+                ];
+            });
+
+        // Get all modules for current semester (even if no grade yet)
+        $currentSemesterModules = Module::where('specialty_id', $student->specialty_id)
+            ->where('semester', $student->current_semester)
+            ->get()
+            ->map(function ($module) use ($currentSemesterGrades) {
+                $grade = $currentSemesterGrades->firstWhere('module_id', $module->id);
+                return [
+                    'module_id' => $module->id,
+                    'module_name' => $module->name,
+                    'module_code' => $module->code,
+                    'coefficient' => $module->coefficient,
+                    'grade' => $grade ? $grade['grade'] : null,
+                    'has_grade' => $grade !== null,
+                ];
+            });
+
+        // Get semester averages from deliberations
+        $semesterAverages = Deliberation::where('student_id', $student->id)
+            ->orderBy('semester', 'asc')
+            ->get()
+            ->map(function ($deliberation) {
+                return [
+                    'semester' => $deliberation->semester,
+                    'average' => $deliberation->average,
+                    'result' => $deliberation->result,
+                    'academic_year' => $deliberation->academic_year,
+                    'observations' => $deliberation->observations,
+                ];
+            });
+
+        // Calculate current semester average if grades exist
+        $currentAverage = null;
+        if ($currentSemesterModules->where('has_grade', true)->count() > 0) {
+            $totalWeighted = 0;
+            $totalCoef = 0;
+            foreach ($currentSemesterModules as $module) {
+                if ($module['grade'] !== null) {
+                    $totalWeighted += $module['grade'] * $module['coefficient'];
+                    $totalCoef += $module['coefficient'];
+                }
+            }
+            if ($totalCoef > 0) {
+                $currentAverage = round($totalWeighted / $totalCoef, 2);
+            }
+        }
+
+        return response()->json([
+            'student' => [
+                'id' => $student->id,
+                'registration_number' => $student->registration_number,
+                'first_name' => $student->first_name,
+                'last_name' => $student->last_name,
+                'full_name' => $student->full_name,
+                'email' => $student->user->email ?? null,
+                'phone' => $student->user->phone ?? null,
+                'date_of_birth' => $student->date_of_birth ? $student->date_of_birth->format('Y-m-d') : null,
+                'address' => $student->address,
+                'is_approved' => $student->user ? $student->user->is_approved : false,
+                'specialty' => $student->specialty ? [
+                    'id' => $student->specialty->id,
+                    'name' => $student->specialty->name,
+                    'code' => $student->specialty->code,
+                ] : null,
+                'study_mode' => $student->study_mode,
+                'current_semester' => $student->current_semester,
+                'group' => $student->group,
+                'years_enrolled' => $student->years_enrolled,
+                'is_graduated' => $student->is_graduated,
+                'graduation_year' => $student->graduation_year,
+                'graduation_semester' => $student->graduation_semester,
+                'final_gpa' => $student->final_gpa,
+                'created_at' => $student->created_at->format('Y-m-d H:i'),
+            ],
+            'current_semester_grades' => $currentSemesterModules,
+            'current_semester_average' => $currentAverage,
+            'semester_averages' => $semesterAverages,
+        ]);
+    }
+
+    /**
+     * Update student
+     */
+    public function updateStudent(StudentStoreRequest $request, $id): JsonResponse
+    {
+        $student = Student::with('user')->findOrFail($id);
+        $validated = $request->validated();
+
+        DB::beginTransaction();
+
+        try {
+            // Update user info
+            if ($student->user) {
+                $userUpdate = [];
+                if (isset($validated['email'])) $userUpdate['email'] = $validated['email'];
+                if (isset($validated['phone'])) $userUpdate['phone'] = $validated['phone'];
+                if (isset($validated['first_name'])) $userUpdate['first_name'] = $validated['first_name'];
+                if (isset($validated['last_name'])) $userUpdate['last_name'] = $validated['last_name'];
+
+                if (!empty($userUpdate)) {
+                    $student->user->update($userUpdate);
+                }
+            }
+
+            // Update student info
+            $studentUpdate = [];
+            $allowedFields = ['first_name', 'last_name', 'date_of_birth', 'address', 'specialty_id', 'study_mode', 'current_semester', 'group', 'years_enrolled', 'is_graduated', 'graduation_year', 'graduation_semester', 'final_gpa'];
+            foreach ($allowedFields as $field) {
+                if (isset($validated[$field])) {
+                    $studentUpdate[$field] = $validated[$field];
+                }
+            }
+
+            if (!empty($studentUpdate)) {
+                $student->update($studentUpdate);
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'message' => 'Étudiant mis à jour avec succès',
+                'student' => [
+                    'id' => $student->id,
+                    'registration_number' => $student->registration_number,
+                    'full_name' => $student->full_name,
+                    'email' => $student->user->email ?? null,
+                    'specialty' => $student->specialty->name,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Delete student
+     */
+    public function deleteStudent($id): JsonResponse
+    {
+        $student = Student::with('user')->findOrFail($id);
+
+        DB::beginTransaction();
+
+        try {
+            $registrationNumber = $student->registration_number;
+            $user = $student->user;
+
+            // Delete student
+            $student->delete();
+
+            // Delete user if exists
+            if ($user) {
+                $user->delete();
+            }
+
+            // Make registration number available again
+            RegistrationNumber::where('number', $registrationNumber)
+                ->update(['is_used' => false, 'used_at' => null]);
+
+            DB::commit();
+
+            return response()->json([
+                'message' => 'Étudiant supprimé avec succès',
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Get pending student registrations
+     */
+    public function pendingRegistrations(): JsonResponse
+    {
+        $pendingStudents = Student::whereNotNull('user_id')
+            ->whereHas('user', function ($query) {
+                $query->where('is_approved', false);
+            })
+            ->with(['user', 'specialty'])
+            ->orderBy('created_at', 'desc')
+            ->get()
+            ->map(function ($student) {
+                return [
+                    'id' => $student->id,
+                    'user_id' => $student->user_id,
+                    'registration_number' => $student->registration_number,
+                    'full_name' => $student->full_name,
+                    'email' => $student->user->email,
+                    'phone' => $student->user->phone,
+                    'specialty' => $student->specialty->name,
+                    'study_mode' => $student->study_mode,
+                    'registered_at' => $student->user->created_at->format('Y-m-d H:i'),
+                ];
+            });
+
+        return response()->json([
+            'pending_registrations' => $pendingStudents,
+            'count' => $pendingStudents->count(),
+        ]);
+    }
+
+    /**
+     * Approve student registration
+     */
+    public function approveRegistration(Request $request, $studentId): JsonResponse
+    {
+        $student = Student::with('user')->findOrFail($studentId);
+
+        if (!$student->user) {
+            return response()->json([
+                'message' => 'Étudiant sans compte',
+            ], 400);
+        }
+
+        if ($student->user->is_approved) {
+            return response()->json([
+                'message' => 'Déjà approuvé',
+            ], 400);
+        }
+
+        $student->user->update(['is_approved' => true]);
+
+        return response()->json([
+            'message' => 'Inscription approuvée',
+            'student' => [
+                'registration_number' => $student->registration_number,
+                'full_name' => $student->full_name,
+                'email' => $student->user->email,
+            ],
+        ]);
+    }
+
+    /**
+     * Reject student registration
+     */
+    public function rejectRegistration(Request $request, $studentId): JsonResponse
+    {
+        $validated = $request->validate([
+            'reason' => 'nullable|string|max:500',
+        ]);
+
+        $student = Student::with('user')->findOrFail($studentId);
+
+        if (!$student->user) {
+            return response()->json([
+                'message' => 'Étudiant sans compte',
+            ], 400);
+        }
+
+        DB::beginTransaction();
+
+        try {
+            $registrationNumber = $student->registration_number;
+            $user = $student->user;
+
+            $student->delete();
+            $user->delete();
+
+            RegistrationNumber::where('number', $registrationNumber)
+                ->update(['is_used' => false, 'used_at' => null]);
+
+            DB::commit();
+
+            return response()->json([
+                'message' => 'Inscription rejetée. Le numéro est à nouveau disponible.',
+                'reason' => $request->reason,
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Reset student password
+     */
+    public function resetStudentPassword(Request $request, $studentId): JsonResponse
+    {
+        $validated = $request->validate([
+            'new_password' => 'required|string|min:6',
+        ]);
+
+        $student = Student::with('user')->findOrFail($studentId);
+
+        if (!$student->user) {
+            return response()->json([
+                'message' => 'Étudiant sans compte utilisateur',
+            ], 400);
+        }
+
+        $student->user->update([
+            'password' => Hash::make($request->new_password),
+        ]);
+
+        return response()->json([
+            'message' => 'Mot de passe réinitialisé avec succès',
+            'registration_number' => $student->registration_number,
+        ]);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // TEACHER MANAGEMENT (FULL CRUD)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Get all teachers
+     */
+    public function getTeachers(Request $request): JsonResponse
+    {
+        $query = Teacher::with(['user', 'modules']);
+
+        // Filter by approval status
+        if ($request->has('approved')) {
+            $query->whereHas('user', function ($q) use ($request) {
+                $q->where('is_approved', $request->boolean('approved'));
+            });
+        }
+
+        // Search by name
+        if ($request->search) {
+            $search = $request->search;
+            $query->where(function($q) use ($search) {
+                $q->where('first_name', 'like', "%{$search}%")
+                  ->orWhere('last_name', 'like', "%{$search}%")
+                  ->orWhere('specialization', 'like', "%{$search}%")
+                  ->orWhereRaw("CONCAT(first_name, ' ', last_name) LIKE ?", ["%{$search}%"]);
+            });
+        }
+
+        $perPage = $request->input('per_page', 10);
+        $teachers = $query->orderBy('last_name')->paginate($perPage);
+
+        $teachers->getCollection()->transform(function ($teacher) {
+            return [
+                'id' => $teacher->id,
+                'full_name' => $teacher->full_name,
+                'first_name' => $teacher->first_name,
+                'last_name' => $teacher->last_name,
+                'email' => $teacher->user->email ?? null,
+                'phone' => $teacher->user->phone ?? null,
+                'specialization' => $teacher->specialization,
+                'is_approved' => $teacher->user ? $teacher->user->is_approved : false,
+                'modules_count' => $teacher->modules->count(),
+                'created_at' => $teacher->created_at->format('Y-m-d'),
+            ];
+        });
+
+        return response()->json($teachers);
+    }
+
+    /**
+     * Get single teacher details
+     */
+    public function getTeacher($id): JsonResponse
+    {
+        $teacher = Teacher::with(['user', 'modules.specialty'])->findOrFail($id);
+
+        return response()->json([
+            'teacher' => [
+                'id' => $teacher->id,
+                'first_name' => $teacher->first_name,
+                'last_name' => $teacher->last_name,
+                'full_name' => $teacher->full_name,
+                'email' => $teacher->user->email ?? null,
+                'phone' => $teacher->user->phone ?? null,
+                'specialization' => $teacher->specialization,
+                'is_approved' => $teacher->user ? $teacher->user->is_approved : false,
+                'modules' => $teacher->modules->map(function($module) {
+                    return [
+                        'id' => $module->id,
+                        'name' => $module->name,
+                        'code' => $module->code,
+                        'specialty' => $module->specialty->name,
+                        'hours_per_week' => $module->hours_per_week,
+                    ];
+                }),
+                'created_at' => $teacher->created_at->format('Y-m-d H:i'),
+            ],
+        ]);
+    }
+
+    /**
+     * Get teacher schedule
+     */
+    public function getTeacherSchedule($id): JsonResponse
+    {
+        $teacher = Teacher::findOrFail($id);
+
+        $schedules = DB::table('schedules')
+            ->join('modules', 'schedules.module_id', '=', 'modules.id')
+            ->join('teacher_module', 'modules.id', '=', 'teacher_module.module_id')
+            ->join('specialties', 'modules.specialty_id', '=', 'specialties.id')
+            ->where('teacher_module.teacher_id', $teacher->id)
+            ->select(
+                'schedules.id',
+                'schedules.day_of_week',
+                'schedules.start_time',
+                'schedules.end_time',
+                'schedules.room_number',
+                'schedules.session_type',
+                'modules.name as module_name',
+                'modules.code as module_code',
+                'specialties.name as specialty_name',
+                'schedules.semester',
+                'schedules.group'
+            )
+            ->orderBy('schedules.day_of_week')
+            ->orderBy('schedules.start_time')
+            ->get();
+
+        return response()->json([
+            'schedule' => $schedules,
+        ]);
+    }
+
+    /**
+     * Create teacher
+     */
+    public function createTeacher(TeacherStoreRequest $request): JsonResponse
+    {
+        $validated = $request->validated();
+
+        DB::beginTransaction();
+
+        try {
+            $user = User::create([
+                'email' => $validated['email'],
+                'phone' => $validated['phone'] ?? null,
+                'password' => Hash::make($validated['password']),
+                'first_name' => $validated['first_name'],
+                'last_name' => $validated['last_name'],
+                'role' => 'teacher',
+                'is_approved' => true,
+            ]);
+
+            $teacher = Teacher::create([
+                'user_id' => $user->id,
+                'first_name' => $validated['first_name'],
+                'last_name' => $validated['last_name'],
+                'specialization' => $validated['specialization'],
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'message' => 'Enseignant créé avec succès',
+                'teacher' => [
+                    'id' => $teacher->id,
+                    'full_name' => $teacher->full_name,
+                    'email' => $user->email,
+                    'specialization' => $teacher->specialization,
+                ],
+            ], 201);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Update teacher
+     */
+    public function updateTeacher(TeacherStoreRequest $request, $id): JsonResponse
+    {
+        $teacher = Teacher::with('user')->findOrFail($id);
+        $validated = $request->validated();
+
+        DB::beginTransaction();
+
+        try {
+            if ($teacher->user) {
+                $userUpdate = [];
+                if (isset($validated['email'])) $userUpdate['email'] = $validated['email'];
+                if (isset($validated['phone'])) $userUpdate['phone'] = $validated['phone'];
+                if (isset($validated['first_name'])) $userUpdate['first_name'] = $validated['first_name'];
+                if (isset($validated['last_name'])) $userUpdate['last_name'] = $validated['last_name'];
+
+                if (!empty($userUpdate)) {
+                    $teacher->user->update($userUpdate);
+                }
+            }
+
+            $teacherUpdate = [];
+            $allowedFields = ['first_name', 'last_name', 'specialization'];
+            foreach ($allowedFields as $field) {
+                if (isset($validated[$field])) {
+                    $teacherUpdate[$field] = $validated[$field];
+                }
+            }
+
+            if (!empty($teacherUpdate)) {
+                $teacher->update($teacherUpdate);
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'message' => 'Enseignant mis à jour avec succès',
+                'teacher' => [
+                    'id' => $teacher->id,
+                    'full_name' => $teacher->full_name,
+                    'email' => $teacher->user->email ?? null,
+                    'specialization' => $teacher->specialization,
+                ],
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Delete teacher
+     */
+    public function deleteTeacher($id): JsonResponse
+    {
+        $teacher = Teacher::with('user')->findOrFail($id);
+
+        DB::beginTransaction();
+
+        try {
+            $user = $teacher->user;
+
+            $teacher->delete();
+
+            if ($user) {
+                $user->delete();
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'message' => 'Enseignant supprimé avec succès',
+            ]);
+
+        } catch (\Exception $e) {
+            DB::rollBack();
+            throw $e;
+        }
+    }
+
+    /**
+     * Reset teacher password
+     */
+    public function resetTeacherPassword(Request $request, $teacherId): JsonResponse
+    {
+        $validated = $request->validate([
+            'new_password' => 'required|string|min:6',
+        ]);
+
+        $teacher = Teacher::with('user')->findOrFail($teacherId);
+
+        if (!$teacher->user) {
+            return response()->json([
+                'message' => 'Enseignant sans compte utilisateur',
+            ], 400);
+        }
+
+        $teacher->user->update([
+            'password' => Hash::make($request->new_password),
+        ]);
+
+        return response()->json([
+            'message' => 'Mot de passe réinitialisé avec succès',
+            'teacher' => $teacher->full_name,
+        ]);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // SPECIALTY MANAGEMENT (FULL CRUD)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Get all specialties
+     */
+    public function getSpecialties(Request $request): JsonResponse
+    {
+        $query = Specialty::withCount('students', 'modules');
+
+        if ($request->has('is_active')) {
+            $query->where('is_active', $request->boolean('is_active'));
+        }
+
+        if ($request->search) {
+            $search = $request->search;
+            $query->where(function($q) use ($search) {
+                $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('code', 'like', "%{$search}%");
+            });
+        }
+
+        $specialties = $query->orderBy('name')->get()->map(function($specialty) {
+            return [
+                'id' => $specialty->id,
+                'name' => $specialty->name,
+                'code' => $specialty->code,
+                'description' => $specialty->description,
+                'duration_semesters' => $specialty->duration_semesters,
+                'is_active' => $specialty->is_active,
+                'students_count' => $specialty->students_count,
+                'modules_count' => $specialty->modules_count,
+                'created_at' => $specialty->created_at->format('Y-m-d'),
+            ];
+        });
+
+        return response()->json([
+            'specialties' => $specialties,
+            'count' => $specialties->count(),
+        ]);
+    }
+
+    /**
+     * Get single specialty
+     */
+    public function getSpecialty($id): JsonResponse
+    {
+        $specialty = Specialty::with(['modules.teachers.user', 'students'])
+            ->withCount('students', 'modules')
+            ->findOrFail($id);
+
+        // Get unique teachers assigned to modules in this specialty
+        $teachers = $specialty->modules->flatMap(function ($module) {
+            return $module->teachers;
+        })->unique('id')->values()->map(function ($teacher) {
+            return [
+                'id' => $teacher->id,
+                'full_name' => $teacher->full_name,
+                'specialization' => $teacher->specialization,
+                'email' => $teacher->user->email ?? null,
+                'phone' => $teacher->user->phone ?? null,
+                'image' => $teacher->user->profile_photo_path ?? null, // Added for UI if needed
+            ];
+        });
+
+        return response()->json([
+            'specialty' => [
+                'id' => $specialty->id,
+                'name' => $specialty->name,
+                'code' => $specialty->code,
+                'description' => $specialty->description,
+                'duration_semesters' => $specialty->duration_semesters,
+                'is_active' => $specialty->is_active,
+                'cover_image' => $specialty->cover_image,
+                'brochure_path' => $specialty->brochure_path,
+                'brochure_name' => $specialty->brochure_name,
+                'students_count' => $specialty->students_count,
+                'modules_count' => $specialty->modules_count,
+                'teachers' => $teachers, // List of all teachers in this specialty
+                'modules' => $specialty->modules->map(function($module) {
+                    return [
+                        'id' => $module->id,
+                        'name' => $module->name,
+                        'code' => $module->code,
+                        'semester' => $module->semester,
+                        'coefficient' => $module->coefficient,
+                        'hours_per_week' => $module->hours_per_week,
+                        'teachers' => $module->teachers->map(function($teacher) {
+                            return [
+                                'id' => $teacher->id,
+                                'full_name' => $teacher->full_name,
+                            ];
+                        }),
+                    ];
+                }),
+            ],
+        ]);
+    }
+
+    /**
+     * Create specialty
+     */
+    public function createSpecialty(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'name' => 'required|string|max:255|unique:specialties,name',
+            'code' => 'required|string|max:10|unique:specialties,code',
+            'description' => 'nullable|string',
+            'duration_semesters' => 'required|integer|min:1|max:10',
+            'is_active' => 'sometimes|boolean',
+        ]);
+
+        $specialty = Specialty::create($validated);
+
+        return response()->json([
+            'message' => 'Spécialité créée avec succès',
+            'specialty' => [
+                'id' => $specialty->id,
+                'name' => $specialty->name,
+                'code' => $specialty->code,
+                'duration_semesters' => $specialty->duration_semesters,
+            ],
+        ], 201);
+    }
+
+    /**
+     * Update specialty
+     */
+    public function updateSpecialty(Request $request, $id): JsonResponse
+    {
+        $specialty = Specialty::findOrFail($id);
+
+        $validated = $request->validate([
+            'name' => ['sometimes', 'string', 'max:255', Rule::unique('specialties')->ignore($id)],
+            'code' => ['sometimes', 'string', 'max:10', Rule::unique('specialties')->ignore($id)],
+            'description' => 'sometimes|nullable|string',
+            'duration_semesters' => 'sometimes|integer|min:1|max:10',
+            'is_active' => 'sometimes|boolean',
+        ]);
+
+        $specialty->update($validated);
+
+        return response()->json([
+            'message' => 'Spécialité mise à jour avec succès',
+            'specialty' => [
+                'id' => $specialty->id,
+                'name' => $specialty->name,
+                'code' => $specialty->code,
+                'duration_semesters' => $specialty->duration_semesters,
+                'is_active' => $specialty->is_active,
+            ],
+        ]);
+    }
+
+    /**
+     * Delete specialty
+     */
+    public function deleteSpecialty($id): JsonResponse
+    {
+        $specialty = Specialty::withCount('students', 'modules')->findOrFail($id);
+
+        if ($specialty->students_count > 0) {
+            return response()->json([
+                'message' => 'Impossible de supprimer une spécialité avec des étudiants',
+            ], 400);
+        }
+
+        if ($specialty->modules_count > 0) {
+            return response()->json([
+                'message' => 'Impossible de supprimer une spécialité avec des modules',
+            ], 400);
+        }
+
+        $specialty->delete();
+
+        return response()->json([
+            'message' => 'Spécialité supprimée avec succès',
+        ]);
+    }
+
+    /**
+     * Toggle specialty active status
+     */
+    public function toggleSpecialtyStatus($id): JsonResponse
+    {
+        $specialty = Specialty::findOrFail($id);
+
+        $specialty->update([
+            'is_active' => !$specialty->is_active,
+        ]);
+
+        return response()->json([
+            'message' => 'Statut modifié avec succès',
+            'specialty' => [
+                'id' => $specialty->id,
+                'name' => $specialty->name,
+                'is_active' => $specialty->is_active,
+            ],
+        ]);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // MODULE MANAGEMENT (FULL CRUD)
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Get all modules
+     */
+    public function getModules(Request $request): JsonResponse
+    {
+        $query = Module::with(['specialty', 'teachers']);
+
+        if ($request->specialty_id) {
+            $query->where('specialty_id', $request->specialty_id);
+        }
+
+        if ($request->semester) {
+            $query->where('semester', $request->semester);
+        }
+
+        if ($request->search) {
+            $search = $request->search;
+            $query->where(function($q) use ($search) {
+                $q->where('name', 'like', "%{$search}%")
+                  ->orWhere('code', 'like', "%{$search}%");
+            });
+        }
+
+        $modules = $query->orderBy('semester')->orderBy('name')->get()->map(function($module) {
+            return [
+                'id' => $module->id,
+                'name' => $module->name,
+                'code' => $module->code,
+                'specialty' => [
+                    'id' => $module->specialty->id,
+                    'name' => $module->specialty->name,
+                ],
+                'semester' => $module->semester,
+                'coefficient' => $module->coefficient,
+                'hours_per_week' => $module->hours_per_week,
+                'teachers_count' => $module->teachers->count(),
+                'created_at' => $module->created_at->format('Y-m-d'),
+            ];
+        });
+
+        return response()->json([
+            'modules' => $modules,
+            'count' => $modules->count(),
+        ]);
+    }
+
+    /**
+     * Get single module
+     */
+    public function getModule($id): JsonResponse
+    {
+        $module = Module::with(['specialty', 'teachers'])->findOrFail($id);
+
+        return response()->json([
+            'module' => [
+                'id' => $module->id,
+                'name' => $module->name,
+                'code' => $module->code,
+                'description' => $module->description,
+                'specialty' => [
+                    'id' => $module->specialty->id,
+                    'name' => $module->specialty->name,
+                    'code' => $module->specialty->code,
+                ],
+                'semester' => $module->semester,
+                'coefficient' => $module->coefficient,
+                'hours_per_week' => $module->hours_per_week,
+                'teachers' => $module->teachers->map(function($teacher) {
+                    return [
+                        'id' => $teacher->id,
+                        'full_name' => $teacher->full_name,
+                        'specialization' => $teacher->specialization,
+                    ];
+                }),
+            ],
+        ]);
+    }
+
+    /**
+     * Create module
+     */
+    public function createModule(ModuleStoreRequest $request): JsonResponse
+    {
+        $validated = $request->validated();
+
+        $module = Module::create($validated);
+
+        return response()->json([
+            'message' => 'Module créé avec succès',
+            'module' => [
+                'id' => $module->id,
+                'name' => $module->name,
+                'code' => $module->code,
+                'specialty' => $module->specialty->name,
+                'semester' => $module->semester,
+            ],
+        ], 201);
+    }
+
+    /**
+     * Update module
+     */
+    public function updateModule(ModuleStoreRequest $request, $id): JsonResponse
+    {
+        $module = Module::findOrFail($id);
+        $validated = $request->validated();
+
+        $module->update($validated);
+
+        return response()->json([
+            'message' => 'Module mis à jour avec succès',
+            'module' => [
+                'id' => $module->id,
+                'name' => $module->name,
+                'code' => $module->code,
+                'specialty' => $module->specialty->name,
+            ],
+        ]);
+    }
+
+    /**
+     * Delete module
+     */
+    public function deleteModule($id): JsonResponse
+    {
+        $module = Module::findOrFail($id);
+
+        // Check if module has grades or attendance
+        $hasGrades = \App\Models\Grade::where('module_id', $id)->exists();
+        $hasAttendance = \App\Models\Attendance::where('module_id', $id)->exists();
+
+        if ($hasGrades || $hasAttendance) {
+            return response()->json([
+                'message' => 'Impossible de supprimer un module avec des notes ou des présences',
+            ], 400);
+        }
+
+        $module->delete();
+
+        return response()->json([
+            'message' => 'Module supprimé avec succès',
+        ]);
+    }
+
+    /**
+     * Assign teacher to module
+     */
+    public function assignTeacherToModule(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'module_id' => 'required|exists:modules,id',
+            'teacher_id' => 'required|exists:teachers,id',
+        ]);
+
+        $module = Module::findOrFail($request->module_id);
+        $teacher = Teacher::findOrFail($request->teacher_id);
+
+        // Check if already assigned
+        if ($module->teachers()->where('teacher_id', $teacher->id)->exists()) {
+            return response()->json([
+                'message' => 'Enseignant déjà assigné à ce module',
+            ], 400);
+        }
+
+        // Calculate current academic year
+        $currentMonth = date('n');
+        $currentYear = date('Y');
+        $academicYear = ($currentMonth >= 9)
+            ? $currentYear . '-' . ($currentYear + 1)
+            : ($currentYear - 1) . '-' . $currentYear;
+
+        $module->teachers()->attach($teacher->id, ['academic_year' => $academicYear]);
+
+        return response()->json([
+            'message' => 'Enseignant assigné avec succès',
+            'module' => $module->name,
+            'teacher' => $teacher->full_name,
+        ]);
+    }
+
+    /**
+     * Remove teacher from module
+     */
+    public function removeTeacherFromModule(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'module_id' => 'required|exists:modules,id',
+            'teacher_id' => 'required|exists:teachers,id',
+        ]);
+
+        $module = Module::findOrFail($request->module_id);
+        $teacher = Teacher::findOrFail($request->teacher_id);
+
+        $module->teachers()->detach($teacher->id);
+
+        return response()->json([
+            'message' => 'Enseignant retiré du module',
+            'module' => $module->name,
+            'teacher' => $teacher->full_name,
+        ]);
+    }
+
+    // ═══════════════════════════════════════════════════════════
+    // PROFILE
+    // ═══════════════════════════════════════════════════════════
+
+    /**
+     * Get admin profile
+     */
+    public function profile(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $admin = $user->administration;
+
+        if (!$admin) {
+            return response()->json([
+                'id' => $user->id,
+                'first_name' => 'Admin',
+                'last_name' => 'User',
+                'email' => $user->email,
+                'phone' => $user->phone,
+                'position' => 'Administrator',
+            ]);
+        }
+
+        return response()->json([
+            'id' => $admin->id,
+            'first_name' => $admin->first_name,
+            'last_name' => $admin->last_name,
+            'email' => $user->email,
+            'phone' => $user->phone,
+            'position' => $admin->position,
+            'created_at' => $admin->created_at->format('Y-m-d'),
+        ]);
+    }
+
+    /**
+     * Update admin profile
+     */
+    public function updateProfile(Request $request): JsonResponse
+    {
+        $user = $request->user();
+        $admin = $user->administration;
+
+        $validated = $request->validate([
+            'first_name' => ['sometimes', 'required', 'string', 'max:100'],
+            'last_name' => ['sometimes', 'required', 'string', 'max:100'],
+            'phone' => ['sometimes', 'nullable', 'string', 'regex:/^0[5-7][0-9]{8}$/', Rule::unique('users')->ignore($user->id)],
+            'position' => ['sometimes', 'nullable', 'string', 'max:255'],
+        ]);
+
+        // Update User (phone)
+        if (isset($validated['phone'])) {
+            $user->update(['phone' => $validated['phone']]);
+        }
+
+        // Update Administration (details)
+        if ($admin) {
+            $admin->update($request->only(['first_name', 'last_name', 'position']));
+        }
+
+        return response()->json([
+            'message' => 'Profil mis à jour avec succès',
+            'user' => [
+                'id' => $admin ? $admin->id : $user->id,
+                'first_name' => $admin ? $admin->first_name : 'Admin',
+                'last_name' => $admin ? $admin->last_name : 'User',
+                'email' => $user->email,
+                'phone' => $user->phone,
+                'position' => $admin ? $admin->position : 'Administrator',
+            ]
+        ]);
+    }
+
+    public function exams(): JsonResponse
+    {
+        $exams = Exam::with(['module', 'teacher', 'specialty'])
+            ->withCount('grades')
+            ->orderBy('created_at', 'desc')
+            ->paginate(20);
+
+        return response()->json($exams);
+    }
+
+    public function examGrades($id): JsonResponse
+    {
+        $exam = \App\Models\Exam::with(['module', 'teacher', 'specialty'])->findOrFail($id);
+
+        $grades = \App\Models\Grade::with(['student'])
+            ->where('exam_id', $id)
+            ->get()
+            ->map(function ($grade) {
+                return [
+                    'id' => $grade->id,
+                    'student_id' => $grade->student_id,
+                    'student' => [
+                        'id' => $grade->student->id,
+                        'first_name' => $grade->student->first_name,
+                        'last_name' => $grade->student->last_name,
+                        'registration_number' => $grade->student->registration_number,
+                    ],
+                    'mark' => (float) $grade->grade,
+                    'grade' => (float) $grade->grade,
+                ];
+            });
+
+        return response()->json([
+            'exam' => [
+                'id' => $exam->id,
+                'title' => $exam->title,
+                'type' => $exam->exam_type,
+                'date' => $exam->exam_date,
+                'module' => $exam->module ? $exam->module->name : '-',
+                'teacher' => $exam->teacher ? $exam->teacher->last_name . ' ' . $exam->teacher->first_name : '-',
+                'group' => $exam->group_name,
+            ],
+            'grades' => $grades,
+        ]);
+    }
+}
